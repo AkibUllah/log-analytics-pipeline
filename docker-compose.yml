@@ -1,0 +1,29 @@
+# Two containers share one DuckDB file on a volume: `follow` tails the mounted
+# nginx log and writes; `api` opens the file read-only per request.
+services:
+  follow:
+    build: .
+    command: ["follow", "/logs/access.log", "--interval", "2"]
+    volumes:
+      - ./data:/logs:ro          # point this at /var/log/nginx on a real host
+      - logpipe-data:/data
+    restart: unless-stopped
+
+  api:
+    build: .
+    command: ["serve", "--host", "0.0.0.0", "--port", "8080"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - logpipe-data:/data
+    depends_on:
+      - follow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  logpipe-data:
