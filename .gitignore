@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+coverage.xml
+dist/
+build/
+
+# Pipeline output / data
+*.duckdb
+*.duckdb.wal
+*.parquet
+*.checkpoint.json
+.logpipe/
+data/*.log
+!data/sample_access.log
+report.html
+out/
+
+# Environment
+.env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
