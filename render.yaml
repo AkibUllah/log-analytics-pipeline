@@ -1,0 +1,22 @@
+# Render blueprint: the stats API from the Dockerfile, seeded at start-up with a synthetic
+# day of traffic so /v1/stats and /v1/alerts answer immediately (the filesystem is ephemeral,
+# so the demo dataset is regenerated on every deploy).
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: log-analytics-pipeline
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: >-
+      sh -c "logpipe generate-sample --lines 50000 --out /tmp/access.log
+      && logpipe ingest /tmp/access.log --no-checkpoint
+      && logpipe serve --host 0.0.0.0 --port 8080"
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: LOGPIPE_DB_PATH
+        value: /data/logpipe.duckdb

@@ -8,6 +8,15 @@ Batch and tail-mode analytics for nginx and JSON access logs: parse, enrich, sto
 ![DuckDB](https://img.shields.io/badge/DuckDB-1.x-fff000)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+## Try it live
+
+| | |
+|---|---|
+| Live demo | https://akibullah.github.io/log-analytics-pipeline/ — the real HTML report `logpipe report --html` produces, rebuilt on every push from a synthetic day of traffic with an injected 5xx incident and flash crowd |
+| Run in your browser | [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/AkibUllah/log-analytics-pipeline?quickstart=1) — generates and ingests 50,000 log lines, then serves the report on port 8000 and the stats API on port 8080 (`/docs`, `/v1/stats?since=1h`); the `logpipe` CLI is on the PATH in the terminal |
+| One-click deploy | [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/AkibUllah/log-analytics-pipeline) — the stats API container, seeded with the same synthetic dataset at start-up |
+| Local | `make install sample ingest html` or `docker compose up --build -d` (see Quick Start) |
+
 ## Why this exists
 
 Most of the incidents I have debugged on payment and e-commerce APIs were first visible in the nginx access log, long before anyone opened a dashboard: a p95 that doubled on the bKash execute endpoint, a 5xx burst on one upstream, a scraper hammering product pages. Shipping those logs to a hosted stack is the right answer at scale, but a lot of client deployments are a couple of VMs where that is overkill. `logpipe` is the single-binary-feeling alternative: it reads the log you already have, keeps an analytical store in one DuckDB file, answers "what happened in the last hour" in a second, and watches the live file for anomalies.
