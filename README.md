@@ -1,3 +1,4 @@
+<!-- topics: python,log-analysis,nginx,duckdb,data-pipeline,anomaly-detection,typer,observability,parquet -->
 # Log Analytics Pipeline
 
 Batch and tail-mode analytics for nginx and JSON access logs: parse, enrich, store in DuckDB, report percentiles and anomalies, export Parquet.
