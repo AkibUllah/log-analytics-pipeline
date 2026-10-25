@@ -4,6 +4,8 @@
 Batch and tail-mode analytics for nginx and JSON access logs: parse, enrich, store in DuckDB, report percentiles and anomalies, export Parquet.
 
 [![CI](https://github.com/AkibUllah/log-analytics-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/AkibUllah/log-analytics-pipeline/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/AkibUllah/log-analytics-pipeline/actions/workflows/codeql.yml/badge.svg)](https://github.com/AkibUllah/log-analytics-pipeline/actions/workflows/codeql.yml)
+[![Release](https://img.shields.io/github/v/release/AkibUllah/log-analytics-pipeline)](https://github.com/AkibUllah/log-analytics-pipeline/releases)
 ![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11-blue)
 ![DuckDB](https://img.shields.io/badge/DuckDB-1.x-fff000)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -16,6 +18,20 @@ Batch and tail-mode analytics for nginx and JSON access logs: parse, enrich, sto
 | Run in your browser | [![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/AkibUllah/log-analytics-pipeline?quickstart=1) — generates and ingests 50,000 log lines, then serves the report on port 8000 and the stats API on port 8080 (`/docs`, `/v1/stats?since=1h`); the `logpipe` CLI is on the PATH in the terminal |
 | One-click deploy | [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/AkibUllah/log-analytics-pipeline) — the stats API container, seeded with the same synthetic dataset at start-up |
 | Local | `make install sample ingest html` or `docker compose up --build -d` (see Quick Start) |
+
+## Screenshots
+
+![Live report walkthrough](docs/images/report-demo.gif)
+
+*Scrolling through the [live report](https://akibullah.github.io/log-analytics-pipeline/): headline numbers, requests per minute with the injected 5xx incident and flash crowd, the anomalies they triggered, top and slowest endpoints, status classes, IPs and devices.*
+
+![Report overview](docs/images/report-overview.png)
+
+*The top of the HTML report produced by `logpipe report --html`.*
+
+![CLI run](docs/images/cli-report.png)
+
+*A local run: a synthetic day of nginx logs, an ingest, a second ingest that the checkpoint turns into a no-op, and the terminal report.*
 
 ## Why this exists
 
@@ -190,11 +206,11 @@ Covered: both parsers (timezone conversion, missing fields, malformed lines, epo
 
 ## Roadmap
 
-- Geo enrichment (MaxMind) and ASN grouping for the top-IP table
-- Seasonal baselines (same minute last week) in addition to the trailing window
-- Alert sinks: webhook and Slack, with per-metric cooldowns
-- Multi-file ingest with glob patterns and compressed (`.gz`) rotated files
-- Retention job that compacts old minutes into hourly rollups inside DuckDB
+- [ ] Geo enrichment (MaxMind) and ASN grouping for the top-IP table (#1)
+- [ ] Seasonal baselines (same minute last week) in addition to the trailing window (#2)
+- [ ] Alert sinks: webhook and Slack, with per-metric cooldowns (#3)
+- [ ] Multi-file ingest with glob patterns and compressed (`.gz`) rotated files (#4)
+- [ ] Retention job that compacts old minutes into hourly rollups inside DuckDB (#5)
 
 ## License
 
