@@ -7,6 +7,7 @@ O(max_centroids) in memory regardless of how many samples it has seen.
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Iterable, Sequence
 
@@ -66,6 +67,9 @@ class QuantileSketch:
     def merge(self, other: QuantileSketch) -> QuantileSketch:
         for mean, weight in other._centroids:
             self.add(mean, weight)
+        # Centroid means sit inside the data range; carry the true extremes over.
+        self.min = min(self.min, other.min)
+        self.max = max(self.max, other.max)
         return self
 
     def _compress(self) -> None:
@@ -90,6 +94,39 @@ class QuantileSketch:
         merged.append((cur_mean, cur_w))
         self._centroids = merged
         self._unmerged = 0
+
+    # -- persistence ------------------------------------------------------
+
+    def to_json(self) -> str:
+        """Compact JSON form (compressed centroids plus count and extremes) for storage
+        in a VARCHAR column; ``from_json`` restores a sketch that merges and queries
+        exactly like the original."""
+        self._compress()
+        empty = self.count == 0
+        return json.dumps(
+            {
+                "compression": self.compression,
+                "count": self.count,
+                "min": None if empty else self.min,
+                "max": None if empty else self.max,
+                "centroids": [[mean, weight] for mean, weight in self._centroids],
+            },
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_json(cls, text: str) -> QuantileSketch:
+        data = json.loads(text)
+        sketch = cls(compression=float(data["compression"]))
+        centroids = [(float(mean), int(weight)) for mean, weight in data["centroids"]]
+        if sum(w for _, w in centroids) != int(data["count"]):
+            raise ValueError("sketch count does not match its centroid weights")
+        sketch._centroids = centroids
+        sketch.count = int(data["count"])
+        if sketch.count:
+            sketch.min = float(data["min"])
+            sketch.max = float(data["max"])
+        return sketch
 
     # -- querying ---------------------------------------------------------
 
