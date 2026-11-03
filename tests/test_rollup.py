@@ -188,3 +188,101 @@ def test_compact_file_backed_store(tmp_path, sample_records):
         hourly_total = ro.con.execute("SELECT sum(requests) FROM hourly").fetchone()[0]
         assert hourly_total == result.rows_compacted
         assert ro.count() + hourly_total == len(sample_records)
+
+
+# -- queries across the raw / rollup boundary -----------------------------------------
+
+BOUNDARY = END - timedelta(hours=1)  # 11:00; 09:00 and 10:00 get compacted
+
+WINDOWS = [
+    (None, None),
+    (END - timedelta(hours=2), None),  # one rollup hour plus raw
+    (END - timedelta(hours=2), END - timedelta(minutes=30)),  # rollup + part of raw
+    (None, BOUNDARY),  # rollups only
+    (BOUNDARY, None),  # raw only
+]
+
+
+def _snapshot(store, since, until):
+    return {
+        "total": store.total_requests(since, until),
+        "errors": round(store.error_rate(since, until), 12),
+        "bytes": store.bytes_sent(since, until),
+        "status": store.status_breakdown(since, until),
+        "devices": sorted(store.device_breakdown(since, until)),
+        "top": [(p, c, round(e, 12)) for p, c, e in store.top_endpoints(50, since, until)],
+        "per_hour": store.requests_per_hour(since, until),
+    }
+
+
+@pytest.mark.parametrize(("since", "until"), WINDOWS)
+def test_queries_stitch_raw_and_rollups(store, since, until):
+    before = _snapshot(store, since, until)
+    exact = store.latency_percentiles(since, until)
+    compact(store, BOUNDARY)
+    assert _snapshot(store, since, until) == before
+
+    p = store.latency_percentiles(since, until)
+    assert p.samples == exact.samples
+    assert p.approximate is (since is None or since < BOUNDARY)
+    for got, want in ((p.p50, exact.p50), (p.p95, exact.p95), (p.p99, exact.p99)):
+        assert got == pytest.approx(want, rel=0.05)
+
+
+def test_window_inside_a_compacted_hour_includes_the_whole_hour(store):
+    hour = datetime(2026, 10, 20, 10, tzinfo=timezone.utc)
+    whole_hour = store.total_requests(hour, hour + timedelta(hours=1))
+    compact(store, BOUNDARY)
+    assert store.total_requests(hour + timedelta(minutes=30), hour + timedelta(minutes=31)) == (
+        whole_hour
+    )
+    assert store.rollup_hours(hour + timedelta(minutes=59), BOUNDARY) == 1
+    assert store.rollup_hours(BOUNDARY, None) == 0
+    assert store.rollup_hours() == 2
+
+
+def test_raw_only_queries_ignore_rollups(store):
+    first, last = store.time_range()
+    compact(store, BOUNDARY)
+    series = store.requests_per_minute()
+    assert series[0][0] == BOUNDARY and len(series) == 60
+    assert store.time_range() == (floor_hour(first), last)
+    assert all(c > 0 for _, c in store.top_ips(3))
+
+
+def test_fully_compacted_store_still_answers(store, sample_records):
+    compact(store, END + timedelta(hours=1))
+    assert store.count() == 0
+    assert store.requests_per_minute() == []
+    assert store.time_range() == (
+        datetime(2026, 10, 20, 9, tzinfo=timezone.utc),
+        END - timedelta(microseconds=1),
+    )
+    assert store.total_requests() == len(sample_records)
+    assert len(store.requests_per_hour()) == 3
+    assert store.latency_percentiles().samples == len(sample_records)
+
+
+def test_gap_between_rollups_and_raw_is_filled():
+    store = Store(":memory:")
+    base = datetime(2026, 10, 20, 6, tzinfo=timezone.utc)
+    store.insert([_rec(base), _rec(base + timedelta(hours=3, minutes=5))])
+    compact(store, base + timedelta(hours=1))
+    assert [(h.hour, n) for h, n, _ in store.requests_per_hour()] == [
+        (6, 1), (7, 0), (8, 0), (9, 1),
+    ]  # fmt: skip
+    store.close()
+
+
+def test_database_without_rollup_tables_is_read_raw_only(tmp_path, sample_records):
+    path = tmp_path / "old.duckdb"
+    with Store(path) as s:
+        s.insert(sample_records[:100])
+        s.con.execute("DROP TABLE hourly")
+        s.con.execute("DROP TABLE hourly_counts")
+    with Store(path, read_only=True) as ro:
+        assert ro.has_rollups is False
+        assert ro.total_requests() == 100
+        assert ro.rollup_hours() == 0
+        assert ro.latency_percentiles().approximate is False
+        assert sum(n for _, n, _ in ro.requests_per_hour()) == 100

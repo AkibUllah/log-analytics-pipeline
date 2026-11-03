@@ -6,12 +6,13 @@ import csv
 import os
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
 
 from logpipe.models import LogRecord
+from logpipe.percentiles import QuantileSketch
 
 COLUMNS = (
     "ts",
@@ -105,16 +106,36 @@ class Percentiles:
     p95: float | None
     p99: float | None
     samples: int
+    # True when the window reaches into hourly rollups and the values come from merged
+    # sketches rather than ``quantile_cont`` over raw rows.
+    approximate: bool = False
 
 
 class Store:
-    """Thin wrapper over a DuckDB connection. Use ``":memory:"`` for tests."""
+    """Thin wrapper over a DuckDB connection. Use ``":memory:"`` for tests.
+
+    Read queries stitch raw ``requests`` rows together with the ``hourly`` rollups that
+    ``logpipe compact`` leaves behind, so totals, breakdowns and percentiles cover the
+    whole window whether or not part of it has been compacted. Rollups have hour
+    granularity: a window that starts or ends inside a compacted hour includes that
+    whole hour. Per-minute series, top IPs, slowest endpoints and Parquet export need
+    individual requests and therefore only see raw rows.
+    """
 
     def __init__(self, path: str | Path = ":memory:", read_only: bool = False) -> None:
         self.path = str(path)
         self.con = duckdb.connect(self.path, read_only=read_only)
         if not read_only:
             self.con.execute(_SCHEMA)
+        # A database written before rollups existed has no hourly tables, and a
+        # read-only connection cannot create them.
+        self.has_rollups = (
+            self.con.execute(
+                "SELECT count(*) FROM duckdb_tables() "
+                "WHERE table_name IN ('hourly', 'hourly_counts')"
+            ).fetchone()[0]
+            == 2
+        )
 
     def close(self) -> None:
         self.con.close()
@@ -170,10 +191,20 @@ class Store:
         return int(self.con.execute("SELECT count(*) FROM requests").fetchone()[0])
 
     def time_range(self) -> tuple[datetime, datetime] | None:
-        row = self.con.execute("SELECT min(ts), max(ts) FROM requests").fetchone()
-        if row is None or row[0] is None:
+        """First and last timestamp held, raw or rolled up. A rollup counts as covering
+        its whole hour."""
+        lo, hi = self.con.execute("SELECT min(ts), max(ts) FROM requests").fetchone()
+        if self.has_rollups:
+            first_hour, last_hour = self.con.execute(
+                "SELECT min(hour), max(hour) FROM hourly"
+            ).fetchone()
+            if first_hour is not None:
+                last_rolled = last_hour + timedelta(hours=1) - timedelta(microseconds=1)
+                lo = first_hour if lo is None else min(lo, first_hour)
+                hi = last_rolled if hi is None else max(hi, last_rolled)
+        if lo is None:
             return None
-        return row[0].replace(tzinfo=timezone.utc), row[1].replace(tzinfo=timezone.utc)
+        return lo.replace(tzinfo=timezone.utc), hi.replace(tzinfo=timezone.utc)
 
     def _window(self, since: datetime | None, until: datetime | None) -> tuple[str, list]:
         clauses, params = [], []
@@ -186,9 +217,71 @@ class Store:
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         return where, params
 
-    def total_requests(self, since=None, until=None) -> int:
+    def _hour_window(self, since: datetime | None, until: datetime | None) -> tuple[str, list]:
+        """``AND`` clauses selecting every rollup hour that overlaps ``[since, until)``."""
+        clauses, params = [], []
+        if since is not None:
+            clauses.append(" AND hour > ?")
+            params.append(_naive_utc(since) - timedelta(hours=1))
+        if until is not None:
+            clauses.append(" AND hour < ?")
+            params.append(_naive_utc(until))
+        return "".join(clauses), params
+
+    def _stitch(
+        self, raw_sql: str, raw_params: list, rollup_sql: str, since, until
+    ) -> tuple[str, list]:
+        """``raw_sql UNION ALL rollup_sql``; ``rollup_sql`` ends in a ``WHERE`` clause that
+        the hour window is appended to. Without rollup tables only ``raw_sql`` is used."""
+        if not self.has_rollups:
+            return raw_sql, raw_params
+        hw, hparams = self._hour_window(since, until)
+        return f"{raw_sql} UNION ALL {rollup_sql}{hw}", raw_params + hparams
+
+    def rollup_hours(self, since=None, until=None) -> int:
+        """Number of compacted hours that overlap the window."""
+        if not self.has_rollups:
+            return 0
+        hw, params = self._hour_window(since, until)
+        return int(
+            self.con.execute(f"SELECT count(*) FROM hourly WHERE TRUE{hw}", params).fetchone()[0]
+        )
+
+    def _totals(self, since, until) -> tuple[int, int, int]:
+        """(requests, 5xx, bytes) across raw rows and rollups."""
         where, params = self._window(since, until)
-        return int(self.con.execute(f"SELECT count(*) FROM requests{where}", params).fetchone()[0])
+        sql, args = self._stitch(
+            "SELECT count(*) AS n, count(*) FILTER (WHERE status >= 500) AS e, "
+            f"coalesce(sum(bytes_sent), 0) AS b FROM requests{where}",
+            params,
+            "SELECT requests, errors_5xx, bytes_sent FROM hourly WHERE TRUE",
+            since,
+            until,
+        )
+        n, e, b = self.con.execute(
+            f"SELECT coalesce(sum(n), 0), coalesce(sum(e), 0), coalesce(sum(b), 0) FROM ({sql})",
+            args,
+        ).fetchone()
+        return int(n), int(e), int(b)
+
+    def _breakdown(self, dim: str, column: str, since, until) -> list[tuple[str, int, int]]:
+        """(key, requests, 5xx) per value of a dimension, raw and rolled up."""
+        where, params = self._window(since, until)
+        sql, args = self._stitch(
+            f"SELECT {column} AS key, count(*) AS n, count(*) FILTER (WHERE status >= 500) AS e "
+            f"FROM requests{where} GROUP BY 1",
+            params,
+            f"SELECT key, requests, errors_5xx FROM hourly_counts WHERE dim = '{dim}'",
+            since,
+            until,
+        )
+        rows = self.con.execute(
+            f"SELECT key, sum(n), sum(e) FROM ({sql}) GROUP BY 1", args
+        ).fetchall()
+        return [(k, int(n), int(e)) for k, n, e in rows]
+
+    def total_requests(self, since=None, until=None) -> int:
+        return self._totals(since, until)[0]
 
     def requests_per_minute(self, since=None, until=None) -> list[tuple[datetime, int, int]]:
         """(minute, requests, 5xx) per minute, gaps filled with zero."""
@@ -218,9 +311,59 @@ class Store:
         ).fetchall()
         return [(m.replace(tzinfo=timezone.utc), int(r), int(e)) for m, r, e in rows]
 
+    def requests_per_hour(self, since=None, until=None) -> list[tuple[datetime, int, int]]:
+        """(hour, requests, 5xx) per hour across raw rows and rollups, gaps filled."""
+        where, params = self._window(since, until)
+        sql, args = self._stitch(
+            "SELECT date_trunc('hour', ts) AS hour, count(*) AS n, "
+            f"count(*) FILTER (WHERE status >= 500) AS e FROM requests{where} GROUP BY 1",
+            params,
+            "SELECT hour, requests, errors_5xx FROM hourly WHERE TRUE",
+            since,
+            until,
+        )
+        rows = self.con.execute(
+            f"""
+            WITH agg AS (SELECT hour, sum(n) AS n, sum(e) AS e FROM ({sql}) GROUP BY 1),
+            bounds AS (SELECT min(hour) AS lo, max(hour) AS hi FROM agg),
+            hours AS (
+                SELECT unnest(generate_series(lo, hi, INTERVAL 1 HOUR)) AS hour FROM bounds
+                WHERE lo IS NOT NULL
+            )
+            SELECT h.hour, coalesce(a.n, 0), coalesce(a.e, 0)
+            FROM hours h LEFT JOIN agg a USING (hour)
+            ORDER BY h.hour
+            """,
+            args,
+        ).fetchall()
+        return [(h.replace(tzinfo=timezone.utc), int(n), int(e)) for h, n, e in rows]
+
     def latency_percentiles(self, since=None, until=None) -> Percentiles:
         where, params = self._window(since, until)
         extra = " AND latency_ms IS NOT NULL" if where else " WHERE latency_ms IS NOT NULL"
+        sketches = []
+        if self.has_rollups:
+            hw, hparams = self._hour_window(since, until)
+            sketches = self.con.execute(
+                f"SELECT latency_sketch FROM hourly WHERE latency_sketch IS NOT NULL{hw}", hparams
+            ).fetchall()
+        if sketches:
+            # Percentiles do not average, so merge the hourly sketches and fold the raw
+            # latencies of the window into the same sketch.
+            sketch = QuantileSketch.from_json(sketches[0][0])
+            for (text,) in sketches[1:]:
+                sketch.merge(QuantileSketch.from_json(text))
+            for value, weight in self.con.execute(
+                f"SELECT latency_ms, count(*) FROM requests{where}{extra} GROUP BY 1", params
+            ).fetchall():
+                sketch.add(value, int(weight))
+            return Percentiles(
+                p50=sketch.quantile(0.50),
+                p95=sketch.quantile(0.95),
+                p99=sketch.quantile(0.99),
+                samples=sketch.count,
+                approximate=True,
+            )
         row = self.con.execute(
             f"""
             SELECT quantile_cont(latency_ms, 0.50), quantile_cont(latency_ms, 0.95),
@@ -232,33 +375,18 @@ class Store:
         return Percentiles(p50=row[0], p95=row[1], p99=row[2], samples=int(row[3]))
 
     def error_rate(self, since=None, until=None) -> float:
-        where, params = self._window(since, until)
-        total, errors = self.con.execute(
-            f"SELECT count(*), count(*) FILTER (WHERE status >= 500) FROM requests{where}", params
-        ).fetchone()
+        total, errors, _ = self._totals(since, until)
         return errors / total if total else 0.0
 
     def status_breakdown(self, since=None, until=None) -> list[tuple[str, int]]:
-        where, params = self._window(since, until)
-        return [
-            (str(k), int(v))
-            for k, v in self.con.execute(
-                f"SELECT status_class, count(*) FROM requests{where} GROUP BY 1 ORDER BY 1", params
-            ).fetchall()
-        ]
+        rows = self._breakdown("status_class", "status_class", since, until)
+        return sorted(((str(k), n) for k, n, _ in rows), key=lambda r: r[0])
 
     def top_endpoints(self, n: int = 10, since=None, until=None) -> list[tuple[str, int, float]]:
         """(normalised path, requests, 5xx rate)."""
-        where, params = self._window(since, until)
-        rows = self.con.execute(
-            f"""
-            SELECT path_normalized, count(*) AS c,
-                   count(*) FILTER (WHERE status >= 500)::DOUBLE / count(*) AS err
-            FROM requests{where} GROUP BY 1 ORDER BY c DESC, 1 LIMIT ?
-            """,
-            params + [n],
-        ).fetchall()
-        return [(p, int(c), float(e)) for p, c, e in rows]
+        rows = self._breakdown("path", "path_normalized", since, until)
+        rows.sort(key=lambda r: (-r[1], r[0] is None, r[0] or ""))
+        return [(p, c, e / c) for p, c, e in rows[:n]]
 
     def slowest_endpoints(
         self, n: int = 10, min_requests: int = 20, since=None, until=None
@@ -285,19 +413,12 @@ class Store:
         return [(ip, int(c)) for ip, c in rows]
 
     def device_breakdown(self, since=None, until=None) -> list[tuple[str, int]]:
-        where, params = self._window(since, until)
-        rows = self.con.execute(
-            f"SELECT device, count(*) AS c FROM requests{where} GROUP BY 1 ORDER BY c DESC", params
-        ).fetchall()
-        return [(d, int(c)) for d, c in rows]
+        rows = self._breakdown("device", "device", since, until)
+        rows.sort(key=lambda r: (-r[1], r[0] is None, r[0] or ""))
+        return [(d, c) for d, c, _ in rows]
 
     def bytes_sent(self, since=None, until=None) -> int:
-        where, params = self._window(since, until)
-        return int(
-            self.con.execute(
-                f"SELECT coalesce(sum(bytes_sent), 0) FROM requests{where}", params
-            ).fetchone()[0]
-        )
+        return self._totals(since, until)[2]
 
     def recent_alerts(self, since=None, limit: int = 50):
         where, params = self._window(since, None)
