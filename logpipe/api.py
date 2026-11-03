@@ -57,6 +57,9 @@ def create_app(db_path: str | Path | None = None, store: Store | None = None) ->
             {"minute": m.isoformat(), "requests": c, "errors_5xx": e}
             for m, c, e in report.per_minute
         ]
+        data["per_hour"] = [
+            {"hour": h.isoformat(), "requests": c, "errors_5xx": e} for h, c, e in report.per_hour
+        ]
         return data
 
     @app.get("/v1/alerts")
