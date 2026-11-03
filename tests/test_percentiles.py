@@ -57,3 +57,39 @@ def test_sketch_validation():
         QuantileSketch(compression=1)
     s.add(42.0)
     assert s.quantile(0.9) == 42.0
+
+
+def test_sketch_merge_keeps_true_extremes():
+    a, b = QuantileSketch(compression=20), QuantileSketch(compression=20)
+    a.extend(range(1, 1001))
+    b.extend(range(5000, 6001))
+    a.merge(b)
+    assert a.min == 1 and a.max == 6000
+    assert a.quantile(0) == 1 and a.quantile(1) == 6000
+    assert QuantileSketch().merge(QuantileSketch()).count == 0
+
+
+def test_sketch_json_roundtrip_queries_and_merges_like_the_original():
+    rng = random.Random(3)
+    values = [rng.lognormvariate(4.0, 0.7) for _ in range(5_000)]
+    original = QuantileSketch()
+    original.extend(values)
+    restored = QuantileSketch.from_json(original.to_json())
+    assert restored.count == original.count == 5_000
+    assert (restored.min, restored.max) == (original.min, original.max)
+    for q in (0.5, 0.95, 0.99):
+        assert restored.quantile(q) == pytest.approx(original.quantile(q))
+    restored.merge(QuantileSketch.from_json(original.to_json()))
+    assert restored.count == 10_000
+    assert restored.quantile(0.5) == pytest.approx(original.quantile(0.5), rel=0.02)
+
+
+def test_sketch_json_empty_and_corrupt():
+    empty = QuantileSketch.from_json(QuantileSketch(compression=50).to_json())
+    assert empty.count == 0 and empty.compression == 50
+    with pytest.raises(ValueError):
+        empty.quantile(0.5)
+    with pytest.raises(ValueError):
+        QuantileSketch.from_json(
+            '{"compression":100,"count":5,"min":1,"max":2,"centroids":[[1.5,4]]}'
+        )
