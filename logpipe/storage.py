@@ -63,6 +63,24 @@ CREATE TABLE IF NOT EXISTS alerts (
     severity  VARCHAR,
     created_at TIMESTAMP DEFAULT current_timestamp
 );
+-- Hourly rollups written by ``logpipe compact`` (see ``logpipe/rollup.py``). Raw rows
+-- older than the retention boundary are folded in here and then deleted, so every
+-- request is counted in exactly one of ``requests`` or ``hourly``.
+CREATE TABLE IF NOT EXISTS hourly (
+    hour            TIMESTAMP PRIMARY KEY,
+    requests        BIGINT NOT NULL,
+    errors_5xx      BIGINT NOT NULL,
+    bytes_sent      BIGINT NOT NULL,
+    latency_samples BIGINT NOT NULL,
+    latency_sketch  VARCHAR
+);
+CREATE TABLE IF NOT EXISTS hourly_counts (
+    hour       TIMESTAMP NOT NULL,
+    dim        VARCHAR NOT NULL,
+    key        VARCHAR,
+    requests   BIGINT NOT NULL,
+    errors_5xx BIGINT NOT NULL
+);
 """
 
 
