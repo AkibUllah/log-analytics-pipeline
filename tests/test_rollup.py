@@ -1,10 +1,13 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 
 from logpipe import rollup
+from logpipe.api import create_app
 from logpipe.models import LogRecord
 from logpipe.percentiles import QuantileSketch, exact_percentile
+from logpipe.report import build_report, render_html, render_text
 from logpipe.rollup import compact, compaction_bounds, floor_hour
 from logpipe.storage import Store
 from tests.conftest import END
@@ -286,3 +289,49 @@ def test_database_without_rollup_tables_is_read_raw_only(tmp_path, sample_record
         assert ro.rollup_hours() == 0
         assert ro.latency_percentiles().approximate is False
         assert sum(n for _, n, _ in ro.requests_per_hour()) == 100
+
+
+# -- report and API across the boundary -------------------------------------------------
+
+
+def test_report_spans_raw_and_rollups(store):
+    since = END - timedelta(hours=2)
+    before = build_report(store, since, None, top=5)
+    compact(store, BOUNDARY)
+    after = build_report(store, since, None, top=5)
+
+    assert after.total_requests == before.total_requests
+    assert after.error_rate == pytest.approx(before.error_rate)
+    assert after.bytes_sent == before.bytes_sent
+    assert after.status_breakdown == before.status_breakdown
+    assert after.top_endpoints == before.top_endpoints
+    assert after.per_hour == before.per_hour
+    assert after.compacted_hours == 1 and before.compacted_hours == 0
+    assert len(after.per_minute) == 60  # minute series only from raw rows
+    assert after.duration_minutes == len(before.per_minute) == 120
+    assert after.avg_rpm == pytest.approx(before.avg_rpm)
+    assert after.percentiles.approximate and not before.percentiles.approximate
+    assert after.percentiles.p95 == pytest.approx(before.percentiles.p95, rel=0.05)
+
+    text = render_text(after)
+    assert "Compacted       1 hour from hourly rollups" in text and "approximate" in text
+    assert "Compacted" not in render_text(before)
+    page = render_html(after)
+    assert "Requests per hour, 1 compacted" in page
+    assert "p95 latency (approx.)" in page
+    assert "Requests per hour" not in render_html(before)
+    assert after.to_dict()["compacted_hours"] == 1
+
+
+def test_api_stats_span_raw_and_rollups(store):
+    client = TestClient(create_app(store=store))
+    before = client.get("/v1/stats", params={"since": "3h"}).json()
+    compact(store, BOUNDARY)
+    after = client.get("/v1/stats", params={"since": "3h"}).json()
+    assert after["total_requests"] == before["total_requests"]
+    assert after["status_breakdown"] == before["status_breakdown"]
+    assert after["per_hour"] == before["per_hour"]
+    assert {"hour", "requests", "errors_5xx"} == set(after["per_hour"][0])
+    assert after["compacted_hours"] == 2
+    assert after["percentiles"]["approximate"] is True
+    assert len(after["per_minute"]) == 60

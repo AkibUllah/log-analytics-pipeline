@@ -28,10 +28,14 @@ class Report:
     top_ips: list[tuple[str, int]]
     devices: list[tuple[str, int]]
     alerts: list[Alert] = field(default_factory=list)
+    per_hour: list[tuple[datetime, int, int]] = field(default_factory=list)
+    # Hours in the window that were served from hourly rollups (``logpipe compact``).
+    compacted_hours: int = 0
 
     @property
     def duration_minutes(self) -> int:
-        return len(self.per_minute)
+        # Rollups and raw rows never cover the same hour, so the two spans add up.
+        return len(self.per_minute) + 60 * self.compacted_hours
 
     @property
     def avg_rpm(self) -> float:
@@ -96,6 +100,8 @@ def build_report(
         top_ips=store.top_ips(top, since, until),
         devices=store.device_breakdown(since, until),
         alerts=alerts,
+        per_hour=store.requests_per_hour(since, until),
+        compacted_hours=store.rollup_hours(since, until),
     )
 
 
@@ -109,6 +115,10 @@ def _fmt_bytes(n: int) -> str:
             return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
         size /= 1024
     return f"{size:.1f} TB"
+
+
+def _hours(n: int) -> str:
+    return f"{n:,} hour" if n == 1 else f"{n:,} hours"
 
 
 def _ms(value: float | None) -> str:
@@ -154,8 +164,13 @@ def render_text(report: Report) -> str:
     p = report.percentiles
     lines.append(
         f"Latency         p50 {_ms(p.p50)}   p95 {_ms(p.p95)}   p99 {_ms(p.p99)}"
-        f"   ({p.samples:,} samples)"
+        f"   ({p.samples:,} samples{', approximate' if p.approximate else ''})"
     )
+    if report.compacted_hours:
+        lines.append(
+            f"Compacted       {_hours(report.compacted_hours)} from hourly rollups; the minute "
+            "series, anomalies, top IPs and slowest endpoints cover raw rows only"
+        )
     lines.append("")
     lines.append("Status classes")
     total = report.total_requests or 1
@@ -212,7 +227,11 @@ def render_text(report: Report) -> str:
 
 
 def _svg_line_chart(
-    points: list[tuple[datetime, int, int]], width: int = 900, height: int = 220
+    points: list[tuple[datetime, int, int]],
+    width: int = 900,
+    height: int = 220,
+    label: str = "Requests per minute",
+    tick_fmt: str = "%H:%M",
 ) -> str:
     if not points:
         return "<p>No data</p>"
@@ -245,10 +264,10 @@ def _svg_line_chart(
     step = max(n // 6, 1)
     for i in range(0, n, step):
         ticks.append(
-            f'<text x="{x(i):.1f}" y="{height - 8}" class="lbl" text-anchor="middle">{points[i][0]:%H:%M}</text>'
+            f'<text x="{x(i):.1f}" y="{height - 8}" class="lbl" text-anchor="middle">{points[i][0].strftime(tick_fmt)}</text>'
         )
     return (
-        f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Requests per minute">'
+        f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="{html.escape(label)}">'
         + "".join(gridlines)
         + f'<path d="{area}" class="area"/>'
         + f'<path d="{req_path}" class="line-req"/>'
@@ -316,6 +335,16 @@ def render_html(report: Report, title: str = "Access log report") -> str:
     device_rows = "".join(
         f"<tr><td>{html.escape(d)}</td><td class='n'>{c:,}</td></tr>" for d, c in report.devices
     )
+    approx = " (approx.)" if p.approximate else ""
+    hourly_html = ""
+    if report.compacted_hours:
+        hourly_html = (
+            '<section class="card"><h2>Requests per hour, '
+            f"{report.compacted_hours:,} compacted</h2>"
+            + _svg_line_chart(report.per_hour, label="Requests per hour", tick_fmt="%m-%d %H:%M")
+            + '<p class="muted">The minute chart, anomalies, top IPs and slowest endpoints '
+            "cover raw rows only.</p></section>"
+        )
     alerts_html = (
         "".join(f'<div class="alert">{html.escape(a.describe())}</div>' for a in report.alerts)
         or '<p class="muted">No anomalies detected.</p>'
@@ -331,13 +360,14 @@ def render_html(report: Report, title: str = "Access log report") -> str:
 {kpi(f"{report.avg_rpm:,.1f}", "avg req/min")}
 {kpi(f"{peak[1]:,}" if peak else "-", "peak req/min")}
 {kpi(f"{report.error_rate:.2%}", "5xx error rate")}
-{kpi(_ms(p.p50), "p50 latency")}
-{kpi(_ms(p.p95), "p95 latency")}
-{kpi(_ms(p.p99), "p99 latency")}
+{kpi(_ms(p.p50), "p50 latency" + approx)}
+{kpi(_ms(p.p95), "p95 latency" + approx)}
+{kpi(_ms(p.p99), "p99 latency" + approx)}
 {kpi(_fmt_bytes(report.bytes_sent), "bytes sent")}
 </section>
 <section class="card"><h2>Requests per minute <span class="legend"><span style="background:#38bdf8"></span>requests <span style="background:#f87171"></span>5xx</span></h2>
 {_svg_line_chart(report.per_minute)}</section>
+{hourly_html}
 <section class="card"><h2>Anomalies ({len(report.alerts)})</h2>{alerts_html}</section>
 <section class="card"><h2>Top endpoints (requests)</h2>{_svg_bars([(path, float(c)) for path, c, _ in report.top_endpoints])}</section>
 <section class="card"><h2>Slowest endpoints (p95 ms, &ge; 20 requests)</h2>{_svg_bars([(path, p95) for path, p95, _ in report.slowest_endpoints], fmt="{:,.0f} ms")}</section>
