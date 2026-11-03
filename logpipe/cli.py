@@ -20,8 +20,10 @@ from logpipe.follow import Follower
 from logpipe.generator import generate_lines
 from logpipe.pipeline import ingest_file
 from logpipe.report import build_report, render_html, render_text
+from logpipe.rollup import compact as compact_store
+from logpipe.rollup import compaction_bounds
 from logpipe.storage import Store
-from logpipe.timeutil import resolve_window
+from logpipe.timeutil import parse_duration, resolve_window
 
 app = typer.Typer(
     help="Access-log analytics: ingest nginx/JSON logs into DuckDB, report, follow, alert.",
@@ -211,6 +213,52 @@ def export(
         since_dt, until_dt = resolve_window(since, until, anchor_dt)
         rows = store.export_parquet(out, since_dt, until_dt)
     console.print(f"[green]exported[/] {rows:,} rows to {out}")
+
+
+@app.command()
+def compact(
+    keep_raw: str = typer.Option(
+        settings.keep_raw, "--keep-raw", help="Keep raw rows this long, e.g. 7d or 48h."
+    ),
+    keep_hourly: str = typer.Option(
+        settings.keep_hourly,
+        "--keep-hourly",
+        help="Delete hourly rollups older than this, e.g. 90d (default: keep forever).",
+    ),
+    anchor: str = typer.Option(
+        "now", "--anchor", help="What the retention ages are relative to: 'now' or 'latest'."
+    ),
+    db: Path | None = DbOption,  # noqa: UP007
+) -> None:
+    """Roll raw rows older than --keep-raw into hourly rollups and apply hourly retention.
+
+    Safe to run repeatedly (e.g. from cron): a run with nothing old enough changes nothing.
+    """
+    if anchor not in ("latest", "now"):
+        raise typer.BadParameter("anchor must be 'latest' or 'now'")
+    try:
+        raw_age = parse_duration(keep_raw)
+        hourly_age = parse_duration(keep_hourly) if keep_hourly else None
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    db_path = db or settings.db_path
+    if not Path(db_path).exists():
+        err_console.print(f"[red]no database at {db_path}; run `logpipe ingest` first[/]")
+        raise typer.Exit(code=1)
+    with Store(db_path) as store:
+        rng = store.time_range()
+        anchor_dt = rng[1] if (anchor == "latest" and rng) else datetime.now(timezone.utc)
+        try:
+            raw_before, hourly_before = compaction_bounds(anchor_dt, raw_age, hourly_age)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        result = compact_store(store, raw_before, hourly_before)
+        remaining = store.count()
+    console.print(
+        f"[green]compacted[/] {result.rows_compacted:,} rows into {result.hours_updated:,} "
+        f"hourly rollups before {raw_before:%Y-%m-%d %H:%M} UTC; "
+        f"expired {result.hours_expired:,} hours; {remaining:,} raw rows remain"
+    )
 
 
 @app.command()
