@@ -25,5 +25,9 @@ class Settings:
         default_factory=lambda: float(_env("ANOMALY_Z_THRESHOLD", "3.0"))
     )
     anomaly_min_points: int = field(default_factory=lambda: int(_env("ANOMALY_MIN_POINTS", "10")))
+    # Retention for ``logpipe compact``: raw rows older than KEEP_RAW become hourly rollups;
+    # rollups older than KEEP_HOURLY are deleted (empty keeps them forever).
+    keep_raw: str = field(default_factory=lambda: _env("KEEP_RAW", "7d"))
+    keep_hourly: str = field(default_factory=lambda: _env("KEEP_HOURLY", ""))
     api_host: str = field(default_factory=lambda: _env("API_HOST", "0.0.0.0"))
     api_port: int = field(default_factory=lambda: int(_env("API_PORT", "8080")))

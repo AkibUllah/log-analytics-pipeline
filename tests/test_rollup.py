@@ -1,16 +1,21 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from typer.testing import CliRunner
 
 from logpipe import rollup
 from logpipe.api import create_app
+from logpipe.cli import app
 from logpipe.models import LogRecord
 from logpipe.percentiles import QuantileSketch, exact_percentile
 from logpipe.report import build_report, render_html, render_text
 from logpipe.rollup import compact, compaction_bounds, floor_hour
 from logpipe.storage import Store
 from tests.conftest import END
+
+runner = CliRunner()
 
 
 def _rec(ts, status=200, latency=10.0, path="/x", nbytes=100):
@@ -335,3 +340,52 @@ def test_api_stats_span_raw_and_rollups(store):
     assert after["compacted_hours"] == 2
     assert after["percentiles"]["approximate"] is True
     assert len(after["per_minute"]) == 60
+
+
+# -- CLI ---------------------------------------------------------------------------
+
+
+def test_cli_compact_end_to_end(tmp_path):
+    db = tmp_path / "c.duckdb"
+    log = tmp_path / "access.log"
+    sample = ["--lines", "1200", "--minutes", "240", "--out", str(log), "--end", END.isoformat()]
+    assert runner.invoke(app, ["generate-sample", *sample]).exit_code == 0
+    res = runner.invoke(app, ["ingest", str(log), "--db", str(db), "--no-checkpoint"])
+    assert res.exit_code == 0, res.output
+    before = json.loads(_report_json(db))
+
+    res = runner.invoke(app, ["compact", "--db", str(db), "--keep-raw", "1h", "--anchor", "latest"])
+    assert res.exit_code == 0, res.output
+    assert "into 2 hourly rollups before 2026-10-20 10:00 UTC" in res.output
+
+    res = runner.invoke(app, ["compact", "--db", str(db), "--keep-raw", "1h", "--anchor", "latest"])
+    assert "compacted 0 rows into 0 hourly rollups" in res.output  # idempotent re-run
+
+    after = json.loads(_report_json(db))
+    assert after["total_requests"] == before["total_requests"] == 1200
+    assert after["status_breakdown"] == before["status_breakdown"]
+    assert after["compacted_hours"] == 2
+
+    retention = ["--keep-raw", "1h", "--keep-hourly", "2h", "--anchor", "latest"]
+    res = runner.invoke(app, ["compact", "--db", str(db), *retention])
+    assert res.exit_code == 0 and "expired 1 hours" in res.output
+
+
+def _report_json(db):
+    res = runner.invoke(app, ["report", "--db", str(db), "--json"])
+    assert res.exit_code == 0, res.output
+    return res.output[res.output.index("{") :]
+
+
+def test_cli_compact_rejects_bad_input(tmp_path):
+    db = tmp_path / "c.duckdb"
+    Store(db).close()
+    for args in (
+        ["--keep-raw", "soon"],
+        ["--keep-raw", "7d", "--keep-hourly", "1d"],
+        ["--anchor", "yesterday"],
+    ):
+        res = runner.invoke(app, ["compact", "--db", str(db), *args])
+        assert res.exit_code != 0, args
+    res = runner.invoke(app, ["compact", "--db", str(tmp_path / "missing.duckdb")])
+    assert res.exit_code == 1
