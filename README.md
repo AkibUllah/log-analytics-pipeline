@@ -48,6 +48,7 @@ Most of the incidents I have debugged on payment and e-commerce APIs were first 
 - Anomaly detection: z-score against a trailing window for request rate and 5xx rate, with a spread floor so quiet traffic does not trigger on a single error and with anomalous minutes excluded from the baseline so a sustained incident keeps alerting
 - Text report, JSON report and a self-contained HTML report with inline SVG charts (no JavaScript, no external assets)
 - Realistic synthetic log generator (daily traffic curve, e-commerce/payments endpoint mix, bots, scanners, a 5xx incident and a flash crowd) for demos and tests
+- Retention: `logpipe compact` folds raw rows older than `--keep-raw` into hourly rollups (requests, 5xx, bytes, status / device / endpoint counts and a mergeable latency sketch per hour), deletes them and expires rollups older than `--keep-hourly`; idempotent and transactional. Reports and the API read raw rows and rollups together transparently
 - Optional read-only FastAPI stats endpoint; Dockerfile and compose with a shared DuckDB volume
 
 ## Architecture
@@ -72,6 +73,7 @@ Key decisions:
 - **Checkpoint by inode and offset, not by line hash.** Cheap, exact, and it survives `logrotate` in both `create` and `copytruncate` modes. A partial last line is deliberately left unread.
 - **Alerts are computed from completed minutes only.** In follow mode the current minute is always partially filled; scoring it would look like a traffic drop every few seconds.
 - **Baselines exclude anomalies.** An incident that lasts 20 minutes should produce 20 alerts, not three alerts and then silence because the spike became the new mean.
+- **Rollups store sketches, not percentiles.** p95 of a day is not the average of 24 hourly p95s. Each hourly rollup keeps a serialised `QuantileSketch`, so any range merges its hours (and the raw latencies after the boundary) into one sketch before reading p50/p95/p99.
 - **Two detectors, two floors.** Request rate uses an absolute floor of 5 req/min; error rate uses 5 percentage points. Both are configurable per run (`--z`, `--window`).
 
 ## Tech Stack
@@ -166,9 +168,26 @@ Common commands:
 | `logpipe report [--since 1h] [--until 10m] [--anchor latest\|now] [--html out.html] [--json]` | Summary, percentiles, top lists, anomalies |
 | `logpipe export out.parquet [--since 1d]` | Parquet export of a window |
 | `logpipe generate-sample [--lines N] [--minutes M] [--format json] [--no-incident]` | Synthetic log |
+| `logpipe compact [--keep-raw 7d] [--keep-hourly 90d] [--anchor now\|latest]` | Roll old raw rows into hourly rollups, delete them, expire old rollups |
 | `logpipe serve [--port 8080]` | Read-only API: `/health`, `/v1/stats`, `/v1/alerts` |
 
 `--since` is relative to the newest record by default (`--anchor latest`), which is what you want when analysing an archived file; pass `--anchor now` for a live log. Settings can also come from `LOGPIPE_*` environment variables (see [`.env.example`](.env.example)).
+
+### Retention and hourly rollups
+
+Every request is a row in DuckDB, so a long-running deployment grows without bound. Schedule `compact` (cron, a systemd timer) to keep a week of raw rows and hourly numbers after that:
+
+```bash
+# Raw rows older than 7 days -> hourly rollups; rollups older than 90 days are deleted.
+.venv/bin/logpipe compact --keep-raw 7d --keep-hourly 90d
+# compacted 412,880 rows into 24 hourly rollups before 2026-10-27 09:00 UTC; expired 24 hours; ...
+```
+
+- The cut-off is rounded down to the hour, so an hour is either fully raw or fully rolled up. Rows ingested late for an already compacted hour are merged into its rollup on the next run.
+- Folding, deleting and expiring happen in one transaction followed by a DuckDB `CHECKPOINT`; a second run with nothing old enough changes nothing.
+- `report`, `/v1/stats` and the `Store` queries combine raw rows and rollups: totals, 5xx rate, bytes, status classes, devices and top endpoints are exact; latency percentiles come from the merged sketches (marked approximate). A window that starts or ends inside a compacted hour includes that whole hour. The JSON report and the API add a `per_hour` series and `compacted_hours`.
+- The minute series, anomaly detection, top IPs, slowest endpoints and Parquet export need individual requests and cover the raw retention window only.
+- Defaults come from `LOGPIPE_KEEP_RAW` (7d) and `LOGPIPE_KEEP_HOURLY` (empty: keep rollups forever). `--anchor latest` measures ages from the newest record instead of the clock, for archived files.
 
 ## Project Structure
 
@@ -183,15 +202,16 @@ logpipe/
 ├── follow.py       # asyncio tail -F with per-minute scoring
 ├── aggregate.py    # MinuteAggregator (in-memory buckets, top counters)
 ├── anomaly.py      # ZScoreDetector, AnomalyMonitor, Alert
-├── percentiles.py  # exact percentiles + QuantileSketch
-├── storage.py      # DuckDB Store: bulk load, queries, Parquet export
+├── percentiles.py  # exact percentiles + QuantileSketch (mergeable, JSON-serialisable)
+├── storage.py      # DuckDB Store: bulk load, queries over raw rows + rollups, Parquet export
+├── rollup.py       # hourly rollups, compaction and retention
 ├── report.py       # Report model, text + HTML/SVG renderers
 ├── generator.py    # synthetic log generator
 ├── timeutil.py     # --since/--until parsing
 ├── api.py          # optional FastAPI stats service
 └── config.py       # LOGPIPE_* settings
 data/sample_access.log   # 3,000-line sample (3 hours, includes an incident)
-tests/                   # 60 tests
+tests/                   # 88 tests
 Dockerfile · docker-compose.yml · Makefile · .github/workflows/ci.yml
 ```
 
@@ -202,7 +222,7 @@ make test     # pytest
 make lint     # ruff check + ruff format --check
 ```
 
-Covered: both parsers (timezone conversion, missing fields, malformed lines, epoch-ms and ISO timestamps), path normalisation table, status classes, UA classification, exact percentiles and sketch accuracy against exact values, per-minute aggregation with gap filling and retention, detector warm-up / spike / baseline isolation / spread floor / per-minute dedupe, checkpoint batching, resume, partial lines, rotation and truncation, DuckDB queries against independently computed expectations, Parquet export, alert persistence, generator determinism and incident injection, report rendering (text and HTML), asyncio follow mode with alerting, CLI end-to-end via `CliRunner`, and the API.
+Covered: both parsers (timezone conversion, missing fields, malformed lines, epoch-ms and ISO timestamps), path normalisation table, status classes, UA classification, exact percentiles and sketch accuracy against exact values, per-minute aggregation with gap filling and retention, detector warm-up / spike / baseline isolation / spread floor / per-minute dedupe, checkpoint batching, resume, partial lines, rotation and truncation, DuckDB queries against independently computed expectations, Parquet export, alert persistence, generator determinism and incident injection, report rendering (text and HTML), compaction (totals per hour, sketch percentiles within 5% of exact, idempotent re-runs, exclusive hour boundary, late rows merging into an existing rollup, rollup retention, rollback on failure) and queries, report and API stitched across the raw/rollup boundary, asyncio follow mode with alerting, CLI end-to-end via `CliRunner`, and the API.
 
 ## Roadmap
 
@@ -210,7 +230,6 @@ Covered: both parsers (timezone conversion, missing fields, malformed lines, epo
 - [ ] Seasonal baselines (same minute last week) in addition to the trailing window (#2)
 - [ ] Alert sinks: webhook and Slack, with per-metric cooldowns (#3)
 - [ ] Multi-file ingest with glob patterns and compressed (`.gz`) rotated files (#4)
-- [ ] Retention job that compacts old minutes into hourly rollups inside DuckDB (#5)
 
 ## License
 
