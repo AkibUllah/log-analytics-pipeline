@@ -37,6 +37,10 @@ jobs:
           logpipe ingest /tmp/access.log --db /tmp/ci.duckdb --no-checkpoint
           logpipe report --db /tmp/ci.duckdb --since 2h --html /tmp/report.html
           test -s /tmp/report.html
+          logpipe compact --db /tmp/ci.duckdb --keep-raw 1h --keep-hourly 3h --anchor latest
+          logpipe compact --db /tmp/ci.duckdb --keep-raw 1h --keep-hourly 3h --anchor latest
+          logpipe report --db /tmp/ci.duckdb --since 4h --html /tmp/report-compacted.html
+          grep -q "compacted" /tmp/report-compacted.html
 
   docker:
     runs-on: ubuntu-latest
