@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `logpipe compact --keep-raw 7d --keep-hourly 90d`: rolls raw rows older than the cut-off into `hourly` / `hourly_counts` rollups (requests, 5xx, bytes, status class, device and endpoint counts, and a serialised latency sketch per hour), deletes them and expires old rollups in one transaction, then checkpoints the database. Re-running it is a no-op; late rows merge into existing rollups (#5).
+- Reports, the stats API and `Store` queries read raw rows and hourly rollups together; percentiles over compacted hours come from merged sketches and are flagged `approximate`. The JSON report and `/v1/stats` gain `per_hour` and `compacted_hours`, and the HTML report adds a per-hour chart when rollups are involved.
+- `LOGPIPE_KEEP_RAW` and `LOGPIPE_KEEP_HOURLY` settings.
+- `QuantileSketch.to_json` / `from_json`.
 - CodeQL analysis for Python and GitHub Actions on pushes and pull requests to `main` and on a weekly schedule.
 - Dependabot version updates for pip, Docker and GitHub Actions, with minor and patch updates grouped per ecosystem.
 - README screenshots: an animated walkthrough of the live report, a report still and a CLI run.
@@ -17,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - CI workflow runs with a read-only `GITHUB_TOKEN`.
+- CI smoke test also compacts the database and renders a report across the rollup boundary.
+
+### Fixed
+
+- `QuantileSketch.merge` keeps the true minimum and maximum of the merged sketch instead of the extreme centroid means.
 
 ## [0.1.0] - 2026-10-25
 
